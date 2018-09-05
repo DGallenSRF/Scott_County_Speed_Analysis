@@ -1,0 +1,271 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r setup,message=FALSE, include=FALSE}
+knitr::opts_knit$set(root.dir = "H:/Projects/11000/11187/TS/NPMRDS 2017-18 Apr & Oct CR 17, 42, 78")
+
+##below are a list of packages required to run the markdown file
+library(tidyverse)
+library(lubridate)
+library(gridExtra)
+library(reshape2)
+library(zoo)
+library(rgdal)
+library(mgcv)
+library(data.table)
+library(plotly)
+library(broom)
+library(nlstools)
+library(purrr)
+library(leaflet)
+library(ggthemes)
+
+```
+
+```{r load metadata}
+
+TMC_ID <- read.csv('./Passenger and trucks with nulls/TMC_Identification.csv',
+                stringsAsFactors = FALSE) %>%
+  select(tmc_code = tmc,Length = miles)
+
+TMC_index <- read.csv('./Passenger and trucks with nulls/metadata.csv',
+                      stringsAsFactors = FALSE) %>%
+  mutate(Length = Segment.Length.Kilometers. * 0.621371) %>%
+  select(Segment.ID, Length)
+
+TMC_desc <- read.csv('TMC_outline.csv', stringsAsFactors = FALSE) %>%
+  melt(id.vars = c('Segment_Index','Corridor','From','To','From_Rd','To_Rd'),
+       value.name = 'tmc_code') %>%
+  filter(tmc_code != '') %>%
+  mutate(variable = gsub('[^[:alnum:] ]', '_', variable))
+  
+TMC_join <- TMC_desc %>%
+  group_by(Segment_Index,variable) %>%
+  summarise(count = n()) %>%
+  ungroup() %>%
+  mutate(index = row.names(.))
+
+TMC_desc <- merge(TMC_desc, select(TMC_join, Segment_Index, variable, index))
+
+```
+
+```{r load records}
+dat <- read.csv('./Passenger and trucks with nulls/Scott-County-2017-18-CR-17-42-78-with-Nulls.csv',
+                stringsAsFactors = FALSE) %>%
+  filter(tmc_code %in% TMC_desc$tmc_code) %>%
+  merge(TMC_ID)
+
+dat_inrix <- read.csv('./Passenger and trucks with nulls/data.csv',stringsAsFactors = FALSE) %>%
+  filter(Segment.ID %in% TMC_desc$tmc_code) %>%
+  filter(Segment.ID != 1450881456,
+         Segment.ID != 1450881471)%>%
+  merge(TMC_index)
+
+rm(TMC_ID, TMC_index, TMC_join, tmc_list)
+```
+
+```{r merge datasets}
+
+scott_data <- dat_inrix %>%
+  mutate(speed = Speed.km.hour. * 0.621371,
+         DateTime = gsub('[^0-9.]', " ", Date.Time),
+         DateTime = as.POSIXct(DateTime, format = '%Y %m %d %H %M %S'),
+         TT = Travel.Time.Minutes. * 60) %>%
+  select(DateTime, tmc_code = Segment.ID, TT, speed, Length)
+  
+scott_dat <- dat %>%
+  mutate(DateTime = as.POSIXct(measurement_tstamp, format = '%Y-%m-%d %H:%M:%S'),
+         Type = 'P_T',
+         MonthYear  = paste(month(DateTime),year(DateTime),sep='')) %>%
+  filter(!is.na(speed),
+         MonthYear != '42017') %>%
+  select(tmc_code, DateTime, speed, TT = travel_time_seconds, Length) %>%
+  rbind(scott_data) %>%
+  merge(select(TMC_desc, tmc_code,index))
+
+rm(scott_data)
+str(scott_dat)
+```
+
+```{r fix meta data}
+
+# tmc_list <- data.frame(tmc_code = unique(dat$tmc_code))
+
+# scott_meta <- TMC_ID %>%
+#   filter(tmc %in% tmc_list$tmc_code) %>%
+#   droplevels() %>%
+#   select(1:14) %>%
+#   melt(measure.vars = c('start_longitude','end_longitude'),
+#        value.name = 'Lon',
+#        variable.name = 'Loc') %>%
+#   mutate(index = seq(1,length(state),1)) %>%
+#   melt(measure.vars = c('start_latitude','end_latitude'),
+#        value.name = 'Lat') %>%
+#   mutate(Location = ifelse(grepl('start',Loc),'Start','End')) %>%
+#   select(-Loc,-variable) 
+
+# write.csv(filter(scott_meta,Location == 'End'), 'Scott_tmc_2017.csv')
+```
+
+```{r add time periods}
+morning <- factor(c('06','07','08','09','10'))
+evening <- factor(c('14','15','16','17','18'))
+
+scott_dat <- scott_dat %>%
+  mutate(Hour = as.factor(format(DateTime,format = '%H')),
+         Date = as.factor(as.Date(DateTime)),
+         Month = as.factor(month(DateTime)),
+         Year = year(DateTime),
+         Day = as.factor(day(DateTime)),
+         Weekday = factor(weekdays(DateTime,abbreviate = TRUE),
+                          levels = c('Mon','Tue',
+                                     'Wed','Thu',
+                                     'Fri','Sat','Sun')),
+         Peak = ifelse(Hour %in% morning,'Morning',
+                       ifelse(Hour %in% evening,'Evening','Off_peak')))
+
+table(is.na(scott_dat$DateTime))   
+table(scott_dat$Peak)
+```
+
+```{r filter peak periods}
+
+n <- scott_dat %>%
+  group_by(tmc_code,Day,Peak) %>%
+  summarise(Count=n()) %>%
+  arrange(desc(Count)) 
+  # filter(Count >= 5)
+
+'%ni%' <- Negate('%in%')
+scott_offpeak <- scott_dat %>%
+  filter(Peak == 'Off_peak') %>%
+  droplevels() 
+
+scott_offpeak %>%
+  group_by(tmc_code,Day,Peak) %>%
+  summarise(Count=n()) %>%
+  arrange((Count)) %>%
+  dcast(Day + Peak ~ tmc_code )
+```
+
+```{r free flow outliers 15 85}
+
+free_flow_quantile <- 0.15
+
+scott_ff <- scott_offpeak %>%
+  droplevels() %>%
+  group_by(index, tmc_code, Month) %>%
+  summarise(Q15 = quantile(TT,free_flow_quantile),
+            Length = max(Length)) %>%
+  mutate(FF = 60/(Q15/60) * Length) %>%
+  group_by(index, Month) %>%
+  summarise(FF = mean(FF)) %>%
+  mutate(Cong_speed = ifelse(FF < 40,
+                             FF - 10,
+                             FF * 0.75))
+
+# scott_ff <- scott_offpeak %>%
+#   droplevels() %>%
+#   group_by(index, tmc_code) %>%
+#   summarise(FF = quantile(speed,free_flow_quantile)) %>%
+#   group_by(index) %>%
+#   summarise(FF = mean(FF)) %>%
+#   mutate(Cong_speed = ifelse(FF < 40,
+#                              FF - 10,
+#                              FF * 0.75))
+
+p <- c(0.15,0.85)
+
+scott_outliers <- scott_dat %>%
+  # filter(Weekday %in% c('Mon','Tue','Wed','Thu','Fri'),
+  #        Peak == 'Evening') %>%
+  # droplevels() %>%
+  group_by(index, tmc_code, Month) %>%
+  summarise(quantiles = list(p*100),
+            Time_q = list(quantile(TT,p)),
+            Length = max(Length)) %>%
+  unnest() %>%
+  mutate(speed_q = 60/(Time_q/60) * Length) %>%
+  group_by(index, Month) %>%
+  mutate(quantiles = paste('Q',quantiles,sep='')) %>%
+  dcast(tmc_code+Month~quantiles,value.var = 'speed_q')
+
+# scott_outliers <- scott_dat %>%
+#   # filter(Weekday %in% c('Mon','Tue','Wed','Thu','Fri'),
+#   #        Peak == 'Evening') %>%
+#   # droplevels() %>%
+#   group_by(index, tmc_code) %>%
+#   summarise(quantiles = list(p*100),
+#             speed_q = list(quantile(speed,p))) %>%
+#   unnest() %>%
+#   group_by(index) %>%
+#   mutate(quantiles = paste('Q',quantiles,sep='')) %>%
+#   dcast(tmc_code~quantiles,value.var = 'speed_q')
+
+scott_final <- merge(scott_dat, scott_ff) %>%
+  merge(scott_outliers) %>%
+  filter(speed > Q85 & speed < Q15,
+         Peak == 'Evening') %>%
+  group_by(index, Hour, Month) %>%
+  summarise(avg_speed = mean(speed),
+            FF = min(FF),
+            Cong_speed = min(Cong_speed)) %>%
+  group_by(index, Month) %>%
+  summarise(speed = min(avg_speed),
+            FF = min(FF),
+            Cong_speed = min(Cong_speed)) %>%
+  merge(TMC_desc,all.x = TRUE) 
+```
+
+```{r create final table}
+
+scott_table <- scott_final[!duplicated(scott_final[,c(1,2)]),]
+
+FF <- scott_table %>%
+  mutate(FF_Dir = paste('FF_',variable,sep='')) %>%
+  select(Segment_Index,FF, Corridor, From, To, FF_Dir, Month) %>%
+  dcast(Segment_Index + Corridor + From + To + Month ~ FF_Dir, value.var = 'FF') %>%
+  mutate(FF_2way = rowMeans(select(.,FF_EB_NB, FF_WB_SB)))
+
+Cong <- scott_table %>%
+  mutate(Cong_Dir = paste('Cong_',variable,sep='')) %>%
+  select(Segment_Index, Cong_speed, Corridor, From, To, Cong_Dir, Month) %>%
+  dcast(Segment_Index + Corridor + From + To + Month ~ Cong_Dir, value.var = 'Cong_speed')%>%
+  mutate(Cong_2way = rowMeans(select(., Cong_EB_NB, Cong_WB_SB))) 
+
+Speed <- scott_table %>%
+  mutate(Speed_Dir = paste('Speed_',variable,sep='')) %>%
+  select(Segment_Index, speed, Corridor, From, To, Speed_Dir, Month) %>%
+  dcast(Segment_Index +Corridor + From + To + Month ~ Speed_Dir, value.var = 'speed') %>%
+  mutate(Speed_2way = rowMeans(select(., Speed_EB_NB, Speed_WB_SB)))
+
+scott_table <- merge(FF,Speed) %>%
+  merge(Cong) %>%
+  select(Corridor, From, To, Month, 
+         FF_EB_NB, FF_WB_SB, FF_2way,
+         Speed_EB_NB, Speed_WB_SB, Speed_2way,
+         Cong_EB_NB, Cong_WB_SB, Cong_2way)
+
+round_df <- function(df, digits) {
+  nums <- vapply(df, is.numeric, FUN.VALUE = logical(1))
+
+  df[,nums] <- round(df[,nums], digits = digits)
+
+  (df)
+}
+
+scott_table <- round_df(scott_table, digits = 0)
+
+write.csv(scott_table,'scott_table.csv', row.names = FALSE)
+
+```
+
+
+
+
+
+
+
+
